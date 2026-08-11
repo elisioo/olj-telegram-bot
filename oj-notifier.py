@@ -88,6 +88,32 @@ def save_settings(settings: dict):
     SETTINGS_FILE.write_text(json.dumps(settings))
 
 
+# ---------- Known users (for multi-user deployments) ----------
+USERS_FILE = BASE_DIR / "users.json"
+
+
+def load_users() -> set:
+    if USERS_FILE.exists():
+        try:
+            return set(json.loads(USERS_FILE.read_text()))
+        except json.JSONDecodeError:
+            return set()
+    return set()
+
+
+def save_users(users: set):
+    USERS_FILE.write_text(json.dumps(sorted(users)))
+
+
+def register_user(chat_id: str):
+    """Remember every chat that has ever messaged the bot, so the background
+    loop knows who to send alerts to. Cheap no-op if already known."""
+    users = load_users()
+    if chat_id not in users:
+        users.add(chat_id)
+        save_users(users)
+
+
 # ---------- Resume storage ----------
 def resume_path(chat_id: str) -> Path:
     return RESUME_DIR / f"{chat_id}.txt"
@@ -104,6 +130,15 @@ def load_resume_text(chat_id: str) -> str:
 
 def save_resume_text(chat_id: str, text: str):
     resume_path(chat_id).write_text(text, encoding="utf-8")
+
+
+def delete_resume(chat_id: str) -> bool:
+    """Remove a user's saved resume. Returns True if a file was actually deleted."""
+    path = resume_path(chat_id)
+    if path.exists():
+        path.unlink()
+        return True
+    return False
 
 
 # ---------- Match-history tracking (new vs. returning matches) ----------
@@ -127,6 +162,7 @@ def load_match_seen(chat_id: str) -> set:
 
 def save_match_seen(chat_id: str, seen_ids: set):
     match_seen_path(chat_id).write_text(json.dumps(sorted(seen_ids)))
+
 
 def download_telegram_file(file_id: str) -> bytes:
     """Download a file the user sent to the bot."""
@@ -176,12 +212,15 @@ def handle_resume_upload(chat_id: str, document: dict):
             "image. Try a text-based PDF or DOCX instead.",
         )
         return
+    had_resume_before = has_resume(chat_id)
     save_resume_text(chat_id, text)
+    verb = "updated" if had_resume_before else "saved"
     send_telegram_message_to(
         chat_id,
-        "\u2705 Resume saved! I'll use it to score how well jobs match your background.\n\n"
+        f"\u2705 Resume {verb}! I'll use it to score how well jobs match your background.\n\n"
         "Send /match to see your best-fit jobs right now, or /automatch on to get only "
-        "AI-matched jobs in your automatic alerts.",
+        "AI-matched jobs in your automatic alerts.\n\n"
+        "You can replace it anytime by sending a new file, or remove it with /resume delete.",
     )
 
 
@@ -208,17 +247,17 @@ def call_groq(system_prompt: str, user_prompt: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def ai_match_jobs(resume_text: str, jobs: list[dict]) -> list[dict]:
-    """Score each job's fit against the resume via Groq.
+# Groq (and most LLM APIs) reject oversized request bodies (HTTP 413).
+# With pagination now pulling 100-300+ jobs per /match run, scoring them in
+# a single request easily blows past that limit -- so we score in batches
+# and merge the results. One bad/oversized batch no longer kills the whole run.
+MATCH_BATCH_SIZE = int(os.environ.get("MATCH_BATCH_SIZE", "20"))
 
-    Returns jobs annotated with match_score/match_reason, sorted best-first.
-    """
-    if not jobs or not resume_text.strip():
-        return []
 
-    trimmed_resume = resume_text[:6000]
+def _score_job_batch(resume_text: str, batch: list[dict]) -> dict:
+    """Ask Groq to score a single batch of jobs. Returns {job_id: {"score":.., "reason":..}}."""
     job_lines = []
-    for j in jobs:
+    for j in batch:
         overview = (j.get("overview") or "")[:300]
         job_lines.append(
             f"id={j['id']} | title={j['title']} | type={j.get('type', '')} | "
@@ -232,34 +271,53 @@ def ai_match_jobs(resume_text: str, jobs: list[dict]) -> list[dict]:
         '{"matches": [{"id": "<job id>", "score": <0-100 integer>, "reason": "<one short sentence>"}]}. '
         "Include every job id given, even low scores."
     )
-    user_prompt = f"RESUME:\n{trimmed_resume}\n\nJOB POSTINGS:\n" + "\n".join(job_lines)
+    user_prompt = f"RESUME:\n{resume_text}\n\nJOB POSTINGS:\n" + "\n".join(job_lines)
 
-    try:
-        raw = call_groq(system_prompt, user_prompt)
-        parsed = json.loads(raw)
-    except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
-        log.error("Groq matching failed: %s", exc)
+    raw = call_groq(system_prompt, user_prompt)
+    parsed = json.loads(raw)
+    return {str(m["id"]): m for m in parsed.get("matches", []) if "id" in m}
+
+
+def ai_match_jobs(resume_text: str, jobs: list[dict]) -> list[dict]:
+    """Score each job's fit against the resume via Groq, in batches.
+
+    Returns jobs annotated with match_score/match_reason, sorted best-first.
+    """
+    if not jobs or not resume_text.strip():
         return []
 
-    scores = {str(m["id"]): m for m in parsed.get("matches", []) if "id" in m}
+    trimmed_resume = resume_text[:6000]
     annotated = []
-    for j in jobs:
-        m = scores.get(str(j["id"]))
-        if not m:
+    total_batches = (len(jobs) + MATCH_BATCH_SIZE - 1) // MATCH_BATCH_SIZE
+
+    for batch_num, start in enumerate(range(0, len(jobs), MATCH_BATCH_SIZE), start=1):
+        batch = jobs[start:start + MATCH_BATCH_SIZE]
+        try:
+            scores = _score_job_batch(trimmed_resume, batch)
+        except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
+            log.error(
+                "Groq matching failed for batch %d/%d (%d jobs): %s",
+                batch_num, total_batches, len(batch), exc,
+            )
             continue
-        score = m.get("score", 0)
-        job = dict(j)
-        job["match_score"] = score
-        job["match_reason"] = m.get("reason", "")
-        annotated.append(job)
+
+        for j in batch:
+            m = scores.get(str(j["id"]))
+            if not m:
+                continue
+            job = dict(j)
+            job["match_score"] = m.get("score", 0)
+            job["match_reason"] = m.get("reason", "")
+            annotated.append(job)
+
+        if batch_num < total_batches:
+            time.sleep(0.5)  # small courtesy pause between Groq calls
+
     annotated.sort(key=lambda j: j["match_score"], reverse=True)
-    if not annotated and parsed.get("matches"):
+    if not annotated and jobs:
         log.warning(
-            "Groq returned %d match entries but none matched a job id. "
-            "Sample returned id: %r, sample job id: %r",
-            len(parsed["matches"]),
-            parsed["matches"][0].get("id"),
-            jobs[0]["id"],
+            "Groq matching produced no scored jobs out of %d input job(s) across %d batch(es).",
+            len(jobs), total_batches,
         )
     return annotated
 
@@ -311,29 +369,28 @@ def jobs_in_match_window(jobs: list[dict], now: datetime | None = None) -> list[
 def send_ai_matches(chat_id: str):
     if not GROQ_API_KEY:
         send_telegram_message_to(
-            chat_id, "⚠️ AI matching isn't set up yet — the bot owner needs to set GROQ_API_KEY."
+            chat_id, "\u26a0\ufe0f AI matching isn't set up yet — the bot owner needs to set GROQ_API_KEY."
         )
         return
     if not has_resume(chat_id):
         send_telegram_message_to(chat_id, "I don't have your resume yet. Send it to me as a file first (PDF, DOCX, or TXT).")
         return
     try:
-        jobs = fetch_jobs()
+        recent_jobs = fetch_recent_jobs(MATCH_LOOKBACK_DAYS)
     except requests.RequestException as exc:
         log.error("Match fetch failed: %s", exc)
-        send_telegram_message_to(chat_id, "⚠️ I couldn't load current jobs right now. Please try again shortly.")
+        send_telegram_message_to(chat_id, "\u26a0\ufe0f I couldn't load current jobs right now. Please try again shortly.")
         return
-    recent_jobs = jobs_in_match_window(jobs)
     if not recent_jobs:
         send_telegram_message_to(
             chat_id,
-            f"😔 I couldn't find job posts from the last {MATCH_LOOKBACK_DAYS} days to compare right now. Try again later.",
+            f"\U0001f614 I couldn't find job posts from the last {MATCH_LOOKBACK_DAYS} days to compare right now. Try again later.",
         )
         return
 
     send_telegram_message_to(
         chat_id,
-        f"🧠 Comparing your resume against {len(recent_jobs)} job post(s) from the last {MATCH_LOOKBACK_DAYS} days...",
+        f"\U0001f9e0 Comparing your resume against {len(recent_jobs)} job post(s) from the last {MATCH_LOOKBACK_DAYS} days...",
     )
     ranked_jobs = ai_match_jobs(load_resume_text(chat_id), recent_jobs)
     strong_matches = [job for job in ranked_jobs if job.get("match_score", 0) >= STRONG_MATCH_SCORE]
@@ -344,46 +401,42 @@ def send_ai_matches(chat_id: str):
     def label_job(job: dict) -> dict:
         job = dict(job)
         if job["id"] in already_sent:
-            job["match_label"] = "🔁 <i>Already sent to you before</i>"
+            job["match_label"] = "\U0001f501 <i>Already sent to you before</i>"
         else:
-            job["match_label"] = "🆕 <i>New match</i>"
+            job["match_label"] = "\U0001f195 <i>New match</i>"
         return job
 
     if strong_matches:
         extra_good_fits = [job for job in good_fit_matches if job["id"] not in {match["id"] for match in strong_matches}]
-        if extra_good_fits:
-            summary = (
-                f"🧠 Found <b>{len(strong_matches)}</b> strong match(es) "
-                f"and <b>{len(extra_good_fits)}</b> other good-fit job(s) for your resume:"
-            )
-        else:
-            summary = f"🧠 Found <b>{len(strong_matches)}</b> strong match(es) for your resume:"
-        send_telegram_message_to(chat_id, summary)
         sent_this_run = set()
+        send_telegram_message_to(chat_id, f"\U0001f3af <b>Strong matches ({len(strong_matches)}):</b>")
         for job in strong_matches:
             send_telegram_message_to(chat_id, format_message(fetch_job_details(label_job(job))))
             sent_this_run.add(job["id"])
             time.sleep(1)
-        for job in extra_good_fits:
-            send_telegram_message_to(chat_id, format_message(fetch_job_details(label_job(job))))
-            sent_this_run.add(job["id"])
-            time.sleep(1)
+        if extra_good_fits:
+            send_telegram_message_to(chat_id, f"\u2705 <b>Good fit ({len(extra_good_fits)}):</b>")
+            for job in extra_good_fits:
+                send_telegram_message_to(chat_id, format_message(fetch_job_details(label_job(job))))
+                sent_this_run.add(job["id"])
+                time.sleep(1)
+        send_telegram_message_to(chat_id, "\U0001f3c1 <b>End.</b>")
         save_match_seen(chat_id, already_sent | sent_this_run)
         return
     elif good_fit_matches:
         matches = good_fit_matches
-        send_telegram_message_to(chat_id, f"🧠 Found <b>{len(matches)}</b> good-fit job(s) for your resume:")
+        send_telegram_message_to(chat_id, f"\u2705 <b>Good fit ({len(matches)}):</b>")
     elif ranked_jobs:
         matches = ranked_jobs[:MAX_SEARCH_RESULTS]
         send_telegram_message_to(
             chat_id,
-            "🧠 I couldn't find any good-fit matches, so here are the closest jobs I found right now:",
+            "\U0001f50d <b>No strong or good-fit matches — closest jobs found:</b>",
         )
     else:
         log.error("AI matching returned no scores for %d recent jobs.", len(recent_jobs))
         send_telegram_message_to(
             chat_id,
-            "⚠️ I found recent jobs, but couldn't score them against your resume right now. Please try again shortly.",
+            "\u26a0\ufe0f I found recent jobs, but couldn't score them against your resume right now. Please try again shortly.",
         )
         return
     sent_this_run = set()
@@ -391,12 +444,24 @@ def send_ai_matches(chat_id: str):
         send_telegram_message_to(chat_id, format_message(fetch_job_details(label_job(job))))
         sent_this_run.add(job["id"])
         time.sleep(1)
+    send_telegram_message_to(chat_id, "\U0001f3c1 <b>End.</b>")
     save_match_seen(chat_id, already_sent | sent_this_run)
 
+
 # ---------- Scraping ----------
-def fetch_jobs() -> list[dict]:
-    """Fetch job listing cards, including their short description and tags."""
-    response = requests.get(SEARCH_URL, headers=HEADERS, timeout=20)
+PAGE_SIZE = 30
+MAX_MATCH_PAGES = int(os.environ.get("MAX_MATCH_PAGES", "10"))
+
+
+def fetch_jobs(offset: int = 0) -> list[dict]:
+    """Fetch job listing cards, including their short description and tags.
+
+    OnlineJobs.ph paginates results 30 per page using a path offset, e.g.
+    /jobseekers/jobsearch/30 for page 2, /jobseekers/jobsearch/60 for page 3.
+    offset=0 is page 1 (the base search URL).
+    """
+    url = SEARCH_URL if offset == 0 else f"{SEARCH_URL.rstrip('/')}/{offset}"
+    response = requests.get(url, headers=HEADERS, timeout=20)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
 
@@ -458,6 +523,34 @@ def fetch_jobs() -> list[dict]:
             "url": "https://www.onlinejobs.ph" + href,
         }
     return list(jobs.values())
+
+
+def fetch_recent_jobs(lookback_days: int = MATCH_LOOKBACK_DAYS, max_pages: int = MAX_MATCH_PAGES) -> list[dict]:
+    """Page through the live search results (30 per page, newest-first) until
+    a page's listings fall entirely outside the lookback window, the results
+    run out, or the safety cap on pages is hit. This is what /match uses so it
+    isn't limited to whatever fits on page 1.
+    """
+    now = datetime.now()
+    cutoff = (now - timedelta(days=lookback_days)).date()
+    collected: dict[str, dict] = {}
+    for page in range(max_pages):
+        offset = page * PAGE_SIZE
+        try:
+            page_jobs = fetch_jobs(offset)
+        except requests.RequestException as exc:
+            log.warning("Paged fetch failed at offset %d: %s", offset, exc)
+            break
+        if not page_jobs:
+            break
+        for job in page_jobs:
+            collected[job["id"]] = job
+        page_dates = [posted_date(job.get("posted", ""), now) for job in page_jobs]
+        # Listings are newest-first, so once every job on this page is older
+        # than the cutoff, every later page will be too - stop paging.
+        if all(d and d < cutoff for d in page_dates):
+            break
+    return list(collected.values())
 
 
 def fetch_job_details(job: dict) -> dict:
@@ -564,7 +657,8 @@ def welcome_message() -> str:
         "\U0001f550 <b>/recent</b> - View the five most recent job posts.",
         "\U0001f4c5 <b>/view_now</b> - View every job updated today.",
         "\U0001f50e <b>/keyword</b> - Search current jobs by keyword.",
-        "\U0001f4c4 <b>/resume</b> - Upload your resume (PDF/DOCX/TXT) for AI matching.",
+        "\U0001f4c4 <b>/resume</b> - Upload your resume (PDF/DOCX/TXT) for AI matching. Send a new file anytime to replace it.",
+        "\U0001f5d1\ufe0f <b>/resume delete</b> - Remove your saved resume.",
         "\U0001f9e0 <b>/match</b> - See jobs that best fit your uploaded resume.",
         "\u2699\ufe0f <b>/automatch on|off</b> - Filter automatic alerts by resume fit.",
         "\U0001f4ac <b>/help</b> - Show this guide again.",
@@ -674,7 +768,13 @@ def send_jobs_updated_today(chat_id: str):
 
 
 def process_commands(offset, seen: set):
-    """Handle /keyword, /refresh, /recent, /view_now, /resume, /match, /automatch."""
+    """Handle /keyword, /refresh, /recent, /view_now, /resume, /match, /automatch.
+
+    Multi-user: any chat that messages the bot is registered and gets its own
+    isolated resume, match history, and automatch setting -- there is no
+    single hardcoded owner chat gating access anymore. TELEGRAM_CHAT_ID (if
+    set) is only used for the bot's own startup notice.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     try:
         response = requests.get(url, params={"offset": offset, "timeout": 1}, timeout=5)
@@ -688,8 +788,9 @@ def process_commands(offset, seen: set):
         offset = update["update_id"] + 1
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
-        if chat_id != CHAT_ID:
+        if not chat_id:
             continue
+        register_user(chat_id)
 
         # A file attachment (no leading "/" needed) is treated as a resume upload.
         document = message.get("document")
@@ -711,10 +812,32 @@ def process_commands(offset, seen: set):
         elif command == "/view_now":
             send_jobs_updated_today(chat_id)
         elif command == "/resume":
-            send_telegram_message_to(
-                chat_id,
-                "\U0001f4c4 Send your resume now as a file attachment (paperclip icon) — PDF, DOCX, or TXT.",
-            )
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) == 2 else ""
+            if arg in {"delete", "remove", "clear"}:
+                if delete_resume(chat_id):
+                    settings = load_settings()
+                    chat_settings = settings.setdefault(chat_id, {})
+                    chat_settings["automatch"] = False
+                    save_settings(settings)
+                    send_telegram_message_to(
+                        chat_id,
+                        "\U0001f5d1\ufe0f Your resume has been deleted. AI matching is now off "
+                        "until you upload a new one.",
+                    )
+                else:
+                    send_telegram_message_to(chat_id, "You don't have a resume saved yet.")
+            elif has_resume(chat_id):
+                send_telegram_message_to(
+                    chat_id,
+                    "\U0001f4c4 You already have a resume saved.\n\n"
+                    "Send a new file to replace it, or use /resume delete to remove it.",
+                )
+            else:
+                send_telegram_message_to(
+                    chat_id,
+                    "\U0001f4c4 Send your resume now as a file attachment (paperclip icon) — PDF, DOCX, or TXT.",
+                )
         elif command == "/match":
             send_ai_matches(chat_id)
         elif command == "/automatch":
@@ -744,6 +867,12 @@ def process_commands(offset, seen: set):
 
 
 def run_once(seen: set) -> set:
+    """Background poll: fetch the newest listings once, then fan them out to
+    every registered user -- resume-matched jobs for users with automatch on,
+    plain keyword-filtered jobs for everyone else. Each user has their own
+    "already sent" history (via match_seen) so nobody gets duplicates and new
+    users don't get flooded with a backlog on their first run.
+    """
     try:
         jobs = fetch_jobs()
     except requests.RequestException as exc:
@@ -753,18 +882,50 @@ def run_once(seen: set) -> set:
         log.warning("No jobs parsed - the site's HTML may have changed.")
         return seen
 
-    candidate_jobs = [job for job in jobs if job["id"] not in seen and matches_keywords(job)]
+    seen.update(job["id"] for job in jobs)
+
+    keyword_candidates = [job for job in jobs if matches_keywords(job)]
+    if not keyword_candidates:
+        return seen
+
+    users = load_users()
+    if not users:
+        return seen
 
     settings = load_settings()
-    automatch_on = settings.get(CHAT_ID, {}).get("automatch", False)
-    if automatch_on and has_resume(CHAT_ID) and candidate_jobs:
-        candidate_jobs = ai_match_jobs(load_resume_text(CHAT_ID), candidate_jobs)
+    details_cache: dict[str, dict] = {}
 
-    for job in reversed(candidate_jobs):
-        log.info("New job: %s", job["title"])
-        send_telegram_message(format_message(fetch_job_details(job)))
-        time.sleep(1)
-    seen.update(job["id"] for job in jobs)
+    def get_detailed(job: dict) -> dict:
+        job_id = job["id"]
+        if job_id not in details_cache:
+            details_cache[job_id] = fetch_job_details(job)
+        return details_cache[job_id]
+
+    for chat_id in users:
+        already_sent = load_match_seen(chat_id)
+        automatch_on = settings.get(chat_id, {}).get("automatch", False)
+
+        if automatch_on and has_resume(chat_id):
+            ranked = ai_match_jobs(load_resume_text(chat_id), keyword_candidates)
+            to_send = [
+                job for job in ranked
+                if job.get("match_score", 0) >= MIN_MATCH_SCORE and job["id"] not in already_sent
+            ]
+            for job in to_send:
+                job["match_label"] = "\U0001f195 <i>New match</i>"
+        else:
+            to_send = [job for job in keyword_candidates if job["id"] not in already_sent]
+
+        if not to_send:
+            continue
+
+        for job in reversed(to_send):
+            log.info("Sending job to %s: %s", chat_id, job["title"])
+            send_telegram_message_to(chat_id, format_message(get_detailed(job)))
+            time.sleep(1)
+
+        save_match_seen(chat_id, already_sent | {job["id"] for job in to_send})
+
     return seen
 
 
@@ -775,18 +936,26 @@ def sanity_check_chat_id():
 
 
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit("Missing config. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.")
+    if not BOT_TOKEN:
+        raise SystemExit("Missing config. Set the TELEGRAM_BOT_TOKEN environment variable.")
     sanity_check_chat_id()
     if "--set-profile-photo" in sys.argv:
         set_bot_profile_photo()
         return
     seen = load_seen()
     command_offset = None
-    log.info("Starting OnlineJobs.ph watcher. %d jobs already known.", len(seen))
-    send_telegram_message(
-        f"\u2705 <b>OnlineJobs.ph notifier started.</b> Watching {len(seen)} known jobs.\n\n{welcome_message()}"
+    log.info(
+        "Starting OnlineJobs.ph watcher. %d jobs already known, %d registered user(s).",
+        len(seen), len(load_users()),
     )
+    # TELEGRAM_CHAT_ID, if set, is treated as the bot admin and gets a
+    # startup notice. It is no longer required -- every other user manages
+    # their own resume/automatch independently once they message the bot.
+    if CHAT_ID:
+        register_user(CHAT_ID)
+        send_telegram_message(
+            f"\u2705 <b>OnlineJobs.ph notifier started.</b> Watching {len(seen)} known jobs.\n\n{welcome_message()}"
+        )
     while True:
         seen = run_once(seen)
         save_seen(seen)
