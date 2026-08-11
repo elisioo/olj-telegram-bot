@@ -22,6 +22,7 @@ pip install -r requirements.txt
 - `OJ_KEYWORDS` — optional comma-separated keywords to filter (example: `virtual assistant, video editor`).
 - `OJ_SEARCH_URL` — optional custom search URL (defaults to `https://www.onlinejobs.ph/jobseekers/jobsearch`).
 - `CHECK_INTERVAL_SECONDS` — optional poll interval in seconds (default `600`).
+- `RESUME_ENCRYPTION_KEY` — required if you want resume files encrypted at rest. Generate one with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
 
 Example (PowerShell):
 
