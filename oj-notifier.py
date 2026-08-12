@@ -813,6 +813,10 @@ def send_stats(chat_id: str):
     )
 
 
+def is_admin_chat(chat_id: str) -> bool:
+    return bool(CHAT_ID) and chat_id == CHAT_ID
+
+
 def process_commands(offset, seen: set):
     """Handle /keyword, /refresh, /recent, /view_now, /resume, /match, /automatch.
 
@@ -858,7 +862,10 @@ def process_commands(offset, seen: set):
         elif command == "/view_now":
             send_jobs_updated_today(chat_id)
         elif command == "/stats":
-            send_stats(chat_id)
+            if is_admin_chat(chat_id):
+                send_stats(chat_id)
+            else:
+                send_telegram_message_to(chat_id, "\u26a0\ufe0f This command is private.")
         elif command == "/resume":
             parts = text.split(maxsplit=1)
             arg = parts[1].strip().lower() if len(parts) == 2 else ""
